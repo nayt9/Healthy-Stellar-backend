@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NotificationsService, MAILER_SERVICE } from './notifications.service';
 import { NotificationsGateway } from '../notifications.gateway';
 import { NotificationPreferencesService } from './notification-preferences.service';
+import { NotificationTemplateService } from './notification-template.service';
 import { NotificationEventType } from '../interfaces/notification-event.interface';
 
 describe('NotificationsService', () => {
@@ -10,6 +11,7 @@ describe('NotificationsService', () => {
   let gateway: jest.Mocked<NotificationsGateway>;
   let preferencesService: jest.Mocked<NotificationPreferencesService>;
   let mockMailerService: { sendMail: jest.Mock };
+  let templateService: jest.Mocked<NotificationTemplateService>;
 
   const buildModule = async (emailFlag = 'false', withMailer = false) => {
     mockMailerService = { sendMail: jest.fn().mockResolvedValue(undefined) };
@@ -45,6 +47,23 @@ describe('NotificationsService', () => {
   beforeEach(() => buildModule());
 
   // ── Direct emit helpers ──────────────────────────────────────────────────
+        {
+          provide: NotificationTemplateService,
+          useValue: {
+            resolve: jest.fn().mockReturnValue({
+              subject: 'Test subject',
+              body: 'Test body',
+              lang: 'en',
+            }),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<NotificationsService>(NotificationsService);
+    gateway = module.get(NotificationsGateway);
+    templateService = module.get(NotificationTemplateService);
+  });
 
   it('should emit record accessed event', () => {
     service.emitRecordAccessed('actor-1', 'resource-1', { detail: 'test' });
@@ -176,6 +195,30 @@ describe('NotificationsService', () => {
       );
 
       expect(mockMailerService.sendMail).not.toHaveBeenCalled();
+  describe('resolveLocalizedNotification', () => {
+    it('delegates to templateService.resolve', () => {
+      const result = service.resolveLocalizedNotification(
+        NotificationEventType.RECORD_ACCESSED,
+        'fr',
+        { resourceId: 'r1', actorId: 'a1' },
+      );
+
+      expect(templateService.resolve).toHaveBeenCalledWith(
+        NotificationEventType.RECORD_ACCESSED,
+        'fr',
+        { resourceId: 'r1', actorId: 'a1' },
+      );
+      expect(result).toEqual({ subject: 'Test subject', body: 'Test body', lang: 'en' });
+    });
+
+    it('passes empty args by default', () => {
+      service.resolveLocalizedNotification(NotificationEventType.ACCESS_GRANTED, 'ar');
+
+      expect(templateService.resolve).toHaveBeenCalledWith(
+        NotificationEventType.ACCESS_GRANTED,
+        'ar',
+        {},
+      );
     });
   });
 });

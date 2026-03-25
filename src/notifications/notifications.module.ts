@@ -6,9 +6,11 @@ import { NotificationsService, MAILER_SERVICE } from './services/notifications.s
 import { NotificationQueueService } from './services/notification-queue.service';
 import { NotificationPreferencesService } from './services/notification-preferences.service';
 import { OnChainEventListenerService } from './services/on-chain-event-listener.service';
+import { NotificationTemplateService } from './services/notification-template.service';
 import { WsAuthGuard } from './guards/ws-auth.guard';
 import { NotificationPreference } from './entities/notification-preference.entity';
 import { AuthModule } from '../auth/auth.module';
+import { I18nAppModule } from '../i18n/i18n.module';
 
 function buildMailerProvider() {
   try {
@@ -31,6 +33,7 @@ const mailerProvider = buildMailerProvider();
     AuthModule,
     TypeOrmModule.forFeature([NotificationPreference]),
   ],
+  imports: [AuthModule, I18nAppModule],
   providers: [
     NotificationsGateway,
     NotificationsService,
@@ -41,5 +44,9 @@ const mailerProvider = buildMailerProvider();
     ...(mailerProvider ? [mailerProvider] : []),
   ],
   exports: [NotificationsService, NotificationPreferencesService, OnChainEventListenerService],
+    NotificationTemplateService,
+    WsAuthGuard,
+  ],
+  exports: [NotificationsService],
 })
 export class NotificationsModule {}
