@@ -1,10 +1,12 @@
-import { Injectable, Inject, forwardRef } from '@nestjs/common';
+import { Injectable, Inject, forwardRef, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, FindOptionsWhere, Between, DataSource } from 'typeorm';
 import { Record } from '../entities/record.entity';
+import { RecordVersion } from '../entities/record-version.entity';
 import { CreateRecordDto } from '../dto/create-record.dto';
 import { PaginationQueryDto } from '../dto/pagination-query.dto';
-import { PaginatedRecordsResponseDto, PaginationMeta } from '../dto/paginated-response.dto';
+import { PaginatedRecordsResponseDto } from '../dto/paginated-response.dto';
+import { RecentRecordDto } from '../dto/recent-record.dto';
 import { IpfsService } from './ipfs.service';
 import { StellarService } from './stellar.service';
 import { AccessControlService } from '../../access-control/services/access-control.service';
@@ -68,7 +70,7 @@ export class RecordsService {
   async findAll(query: PaginationQueryDto): Promise<PaginatedRecordsResponseDto> {
     const {
       page = 1,
-      limit = 20,
+      pageSize = 20,
       recordType,
       fromDate,
       toDate,
@@ -77,17 +79,9 @@ export class RecordsService {
       patientId,
     } = query;
 
-    // Build where clause
-    const where: FindOptionsWhere<Record> = {};
-
-    if (recordType) {
-      where.recordType = recordType;
-    }
-
-    if (patientId) {
-      where.patientId = patientId;
-    }
-
+    const where: FindOptionsWhere<Record> = { isDeleted: false };
+    if (recordType) where.recordType = recordType;
+    if (patientId) where.patientId = patientId;
     if (fromDate && toDate) {
       where.createdAt = Between(new Date(fromDate), new Date(toDate));
     } else if (fromDate) {
@@ -96,42 +90,40 @@ export class RecordsService {
       where.createdAt = Between(new Date(0), new Date(toDate));
     }
 
-    // Calculate pagination
-    const skip = (page - 1) * limit;
-
-    // Execute query
-    const [data, total] = await this.recordRepository.findAndCount({
-      where,
-      order: {
-        [sortBy]: order.toUpperCase(),
+    return PaginationUtil.paginate(
+      this.recordRepository,
+      { page, pageSize },
+      {
+        where,
+        order: {
+          [sortBy]: order.toUpperCase() as any,
+        },
       },
-      take: limit,
-      skip,
-    });
-
-    // Calculate metadata
-    const totalPages = Math.ceil(total / limit);
-    const hasNextPage = page < totalPages;
-    const hasPreviousPage = page > 1;
-
-    const meta: PaginationMeta = {
-      total,
-      page,
-      limit,
-      totalPages,
-      hasNextPage,
-      hasPreviousPage,
-    };
-
-    return {
-      data,
-      meta,
-    };
+    );
   }
 
-  async findOne(id: string, requesterId?: string): Promise<Record> {
+  async generateQrCode(id: string, patientId: string): Promise<string> {
     const record = await this.recordRepository.findOne({ where: { id } });
-    
+    if (!record) throw new NotFoundException(`Record ${id} not found`);
+
+    const token = await this.stellarService.createShareLink(id, patientId);
+    const appDomain = process.env.APP_DOMAIN || 'https://app.domain.com';
+    const url = `${appDomain}/share/${token}`;
+    return QRCode.toDataURL(url);
+  }
+
+  async findOne(
+    id: string,
+    requesterId?: string,
+    includeDeleted = false,
+    version?: number,
+  ): Promise<Record | (Record & { _version: RecordVersion })> {
+    const record = await this.recordRepository.findOne({ where: { id } });
+
+    if (!record || (!includeDeleted && record.isDeleted)) {
+      throw new NotFoundException(`Record ${id} not found`);
+    }
+
     if (record && requesterId) {
       const emergencyGrant = await this.accessControlService.findActiveEmergencyGrant(
         record.patientId,
@@ -154,7 +146,167 @@ export class RecordsService {
         });
       }
     }
-    
+
+    // If a specific version is requested, overlay the versioned CID and hash
+    if (version !== undefined) {
+      const recordVersion = await this.recordVersionService.findVersion(id, version);
+      if (!recordVersion) {
+        throw new NotFoundException(`Version ${version} of record ${id} not found`);
+      }
+      return Object.assign(Object.create(Object.getPrototypeOf(record)), record, {
+        cid: recordVersion.cid,
+        stellarTxHash: recordVersion.stellarTxHash,
+        _version: recordVersion,
+      });
+    }
+
     return record;
+  }
+
+  async findRecent(): Promise<RecentRecordDto[]> {
+    const records = await this.recordRepository.find({
+      order: {
+        createdAt: 'DESC',
+      },
+      take: 50,
+      cache: 30000, // 30 seconds cache
+    });
+
+    return records.map((record) => ({
+      recordId: record.id,
+      patientAddress: this.truncateAddress(record.patientId),
+      providerAddress: 'System', // As records entity doesn't have providerId yet, defaulting to 'System'
+      recordType: record.recordType,
+      createdAt: record.createdAt,
+    }));
+  }
+
+  private truncateAddress(address: string): string {
+    if (address.length <= 10) return address;
+    return `${address.substring(0, 6)}...${address.substring(address.length - 4)}`;
+  }
+
+  /**
+   * Derive the current state of a record by replaying its event stream.
+   * Falls back to the latest snapshot + delta events for performance.
+   */
+  async getStateFromEvents(id: string): Promise<RecordState> {
+    const state = await this.eventStore.replayToState(id);
+    if (!state || state.deleted) {
+      throw new NotFoundException(`Record ${id} not found in event store`);
+    }
+    return state;
+  }
+
+  /**
+   * Return the raw event stream for a record (admin only).
+   */
+  async getEventStream(id: string): Promise<RecordEvent[]> {
+    const events = await this.eventStore.getEvents(id);
+    if (events.length === 0) {
+      throw new NotFoundException(`No events found for record ${id}`);
+    }
+    return events;
+  }
+
+  /**
+   * Search records with dynamic filtering via QueryBuilder.
+   *
+   * Access control:
+   *  - Admin / Physician: can search all records, including by arbitrary patientAddress
+   *  - Patient / other roles: always scoped to their own patientId; patientAddress param ignored
+   *
+   * CID masking:
+   *  - Raw IPFS CIDs are only included when the caller is the record owner (patientId === callerId)
+   */
+  async search(
+    dto: SearchRecordsDto,
+    callerId: string,
+    callerRole: string,
+  ): Promise<SearchRecordsResponseDto> {
+    const { patientAddress, providerAddress, type, from, to, q, page = 1, pageSize = 20 } = dto;
+
+    const isPrivileged =
+      callerRole === UserRole.ADMIN || callerRole === (UserRole as any).PHYSICIAN || callerRole === 'physician';
+
+    const qb = this.recordRepository
+      .createQueryBuilder('record')
+      .select([
+        'record.id',
+        'record.patientId',
+        'record.providerId',
+        'record.cid',
+        'record.stellarTxHash',
+        'record.recordType',
+        'record.description',
+        'record.createdAt',
+      ])
+      // Always exclude soft-deleted records from search results
+      .andWhere('record.isDeleted = :isDeleted', { isDeleted: false });
+
+    // ── Access control scoping ────────────────────────────────────────────
+    if (isPrivileged) {
+      // Admin/Physician: honour the optional patientAddress filter
+      if (patientAddress) {
+        qb.andWhere('record.patientId = :patientAddress', { patientAddress });
+      }
+    } else {
+      // Non-privileged: always restrict to own records, ignore patientAddress param
+      qb.andWhere('record.patientId = :callerId', { callerId });
+    }
+
+    // ── Dynamic filters ───────────────────────────────────────────────────
+    if (providerAddress) {
+      qb.andWhere('record.providerId = :providerAddress', { providerAddress });
+    }
+
+    if (type) {
+      qb.andWhere('record.recordType = :type', { type });
+    }
+
+    if (from) {
+      qb.andWhere('record.createdAt >= :from', { from: new Date(from) });
+    }
+
+    if (to) {
+      qb.andWhere('record.createdAt <= :to', { to: new Date(to) });
+    }
+
+    // ── Full-text search on description ───────────────────────────────────
+    if (q) {
+      qb.andWhere('record.description ILIKE :q', { q: `%${q}%` });
+    }
+
+    // ── Pagination ────────────────────────────────────────────────────────
+    const skip = (page - 1) * pageSize;
+    qb.orderBy('record.createdAt', 'DESC').skip(skip).take(pageSize);
+
+    const [records, total] = await qb.getManyAndCount();
+
+    // ── CID masking: strip raw CID for non-owners ─────────────────────────
+    const data: SearchRecordItem[] = records.map((r) => {
+      const isOwner = r.patientId === callerId;
+      return {
+        id: r.id,
+        patientId: r.patientId,
+        providerId: r.providerId ?? null,
+        stellarTxHash: r.stellarTxHash ?? null,
+        recordType: r.recordType,
+        description: r.description ?? null,
+        createdAt: r.createdAt,
+        // Only expose raw CID to the record owner
+        ...(isOwner || isPrivileged ? { cid: r.cid } : {}),
+      };
+    });
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        pageSize,
+        totalPages: Math.ceil(total / pageSize),
+      },
+    };
   }
 }

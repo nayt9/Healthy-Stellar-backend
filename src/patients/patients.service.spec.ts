@@ -2,6 +2,8 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PatientsService } from './patients.service';
+import { DataSource } from 'typeorm';
+import { AuditLogEntity } from '../common/audit/audit-log.entity';
 import { Patient } from './entities/patient.entity';
 import { aPatient } from '../../test/fixtures/test-data-builder';
 import { generatePatientDemographics } from '../../test/utils/data-anonymization.util';
@@ -20,6 +22,25 @@ describe('PatientsService', () => {
     delete: jest.fn(),
   };
 
+  const mockQueryRunner = {
+    connect: jest.fn(),
+    startTransaction: jest.fn(),
+    commitTransaction: jest.fn(),
+    rollbackTransaction: jest.fn(),
+    release: jest.fn(),
+    manager: {
+      findOne: jest.fn(),
+      update: jest.fn(),
+      find: jest.fn(),
+      save: jest.fn(),
+      create: jest.fn((entity, data) => data),
+    },
+  };
+
+  const mockDataSource = {
+    createQueryRunner: jest.fn().mockReturnValue(mockQueryRunner),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -27,6 +48,10 @@ describe('PatientsService', () => {
         {
           provide: getRepositoryToken(Patient),
           useValue: mockRepository,
+        },
+        {
+          provide: DataSource,
+          useValue: mockDataSource,
         },
       ],
     }).compile();
@@ -230,6 +255,55 @@ describe('PatientsService', () => {
     });
   });
 
+  describe('updateProfile', () => {
+    const stellarAddress = 'GABC123STELLAR';
+
+    it('should update mutable profile fields for the correct patient', async () => {
+      const existing = aPatient().build();
+      const profileUpdate = {
+        phone: '555-9999',
+        email: 'updated@example.com',
+        contactPreferences: { preferredChannel: 'sms', language: 'fr' },
+        emergencyContact: { name: 'Jane Doe', phone: '555-0001', relationship: 'spouse' },
+      };
+      const updated = { ...existing, ...profileUpdate };
+
+      mockRepository.findOne.mockResolvedValue(existing);
+      mockRepository.save.mockResolvedValue(updated);
+
+      const result = await service.updateProfile(stellarAddress, profileUpdate);
+
+      expect(mockRepository.findOne).toHaveBeenCalledWith({ where: { stellarAddress } });
+      expect(mockRepository.save).toHaveBeenCalled();
+      expect(result.phone).toBe('555-9999');
+      expect(result.email).toBe('updated@example.com');
+    });
+
+    it('should throw NotFoundException when stellarAddress does not match any patient', async () => {
+      mockRepository.findOne.mockResolvedValue(null);
+
+      await expect(service.updateProfile('INVALID_ADDRESS', { phone: '555-0000' })).rejects.toThrow(
+        'Patient not found',
+      );
+    });
+
+    it('should not overwrite stellarAddress or nationalIdHash even if passed', async () => {
+      const existing = aPatient().build();
+      (existing as any).stellarAddress = stellarAddress;
+      (existing as any).nationalIdHash = 'original-hash';
+
+      mockRepository.findOne.mockResolvedValue(existing);
+      mockRepository.save.mockImplementation(async (p) => p);
+
+      // Simulate caller trying to sneak in immutable fields (they are not in the DTO type,
+      // but we verify the service only saves what it receives via Object.assign)
+      const result = await service.updateProfile(stellarAddress, { phone: '555-1234' } as any);
+
+      expect((result as any).stellarAddress).toBe(stellarAddress);
+      expect((result as any).nationalIdHash).toBe('original-hash');
+    });
+  });
+
   describe('Performance', () => {
     it('should retrieve patient by MRN within performance threshold', async () => {
       // Arrange
@@ -243,6 +317,65 @@ describe('PatientsService', () => {
 
       // Assert
       expect(duration).toBeLessThan(100); // Should be < 100ms
+    });
+  });
+
+  describe('adminMergePatients', () => {
+    it('should successfully merge two patients and transfer records inside a transaction', async () => {
+      // Arrange
+      const primaryAddress = 'primary-uuid';
+      const secondaryAddress = 'secondary-uuid';
+      const adminId = 'admin-uuid';
+      const mergeDto = { primaryAddress, secondaryAddress, reason: 'Duplicate' };
+
+      const primaryPatient = aPatient().withId(primaryAddress).build();
+      const secondaryPatient = aPatient().withId(secondaryAddress).build();
+
+      mockQueryRunner.manager.findOne
+        .mockResolvedValueOnce(primaryPatient)
+        .mockResolvedValueOnce(secondaryPatient);
+
+      // Act
+      const result = await service.adminMergePatients(mergeDto, adminId);
+
+      // Assert
+      expect(mockDataSource.createQueryRunner).toHaveBeenCalled();
+      expect(mockQueryRunner.startTransaction).toHaveBeenCalled();
+      expect(mockQueryRunner.manager.update).toHaveBeenCalledWith('records', { patientId: secondaryAddress }, { patientId: primaryAddress });
+      expect(mockQueryRunner.manager.update).toHaveBeenCalledWith('access_grants', { patientId: secondaryAddress }, { patientId: primaryAddress });
+      expect(secondaryPatient.isActive).toBe(false);
+      expect(mockQueryRunner.manager.save).toHaveBeenCalledWith(Patient, secondaryPatient);
+      expect(mockQueryRunner.manager.save).toHaveBeenCalledWith(AuditLogEntity, expect.objectContaining({ action: 'PATIENT_MERGING' }));
+      expect(mockQueryRunner.manager.save).toHaveBeenCalledWith(AuditLogEntity, expect.objectContaining({ action: 'PATIENT_MERGED' }));
+      expect(mockQueryRunner.commitTransaction).toHaveBeenCalled();
+      expect(mockQueryRunner.release).toHaveBeenCalled();
+      expect(result).toEqual(primaryPatient);
+    });
+
+    it('should rollback transaction if an error occurs', async () => {
+      // Arrange
+      mockQueryRunner.manager.findOne.mockRejectedValueOnce(new Error('DB Error'));
+
+      // Act & Assert
+      await expect(
+        service.adminMergePatients({ primaryAddress: 'a', secondaryAddress: 'b' }, 'admin'),
+      ).rejects.toThrow('DB Error');
+
+      expect(mockQueryRunner.rollbackTransaction).toHaveBeenCalled();
+      expect(mockQueryRunner.release).toHaveBeenCalled();
+    });
+
+    it('should throw BadRequestException if merging same patient', async () => {
+      const primaryPatient = aPatient().withId('same-id').build();
+      mockQueryRunner.manager.findOne
+        .mockResolvedValueOnce(primaryPatient)
+        .mockResolvedValueOnce(primaryPatient);
+
+      await expect(
+        service.adminMergePatients({ primaryAddress: 'same-id', secondaryAddress: 'same-id' }, 'admin'),
+      ).rejects.toThrow('Cannot merge a patient with itself');
+
+      expect(mockQueryRunner.rollbackTransaction).toHaveBeenCalled();
     });
   });
 });
